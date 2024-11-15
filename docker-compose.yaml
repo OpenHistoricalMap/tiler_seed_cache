@@ -1,0 +1,12 @@
+version: '3'
+services:
+  tiler:
+    image: rub21/tiler_benchmark:v1
+    build:
+      context: .
+      dockerfile: Dockerfile
+    environment:
+        - AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID}
+        - AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY}
+    # volumes:
+    #     - ./:/app

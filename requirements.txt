@@ -1,0 +1,8 @@
+requests
+joblib
+tqdm
+click
+mercantile
+geopandas
+aiohttp
+boto3
