@@ -40,7 +40,6 @@ def geojson_to_tiles(
         return []
 
     geometry = gdf.unary_union
-
     result = []
 
     for zoom in zoom_levels:
@@ -48,14 +47,12 @@ def geojson_to_tiles(
         for tile in mercantile.tiles(minx, miny, maxx, maxy, zoom):
             tile_geom = shape(mercantile.feature(tile)["geometry"])
             if geometry.intersects(tile_geom):
-                bounds = mercantile.bounds(tile.x, tile.y, tile.z)
-                centroid_lon = (bounds.west + bounds.east) / 2
-                centroid_lat = (bounds.south + bounds.north) / 2
-
+                centroid_lon, centroid_lat = tile_to_centroid(tile.x, tile.y, tile.z)
                 result.append(
                     {
                         "url": base_url.format(z=tile.z, x=tile.x, y=tile.y),
                         "centroid": (centroid_lon, centroid_lat),
+                        "zoom": zoom,  # Explicitly store the zoom level
                     }
                 )
 
@@ -65,11 +62,12 @@ def geojson_to_tiles(
 async def fetch_tile(session, url, timeout=600):
     start_time = time.time()
     try:
-        async with asyncio.wait_for(session.get(url), timeout=timeout) as response:
-            response_time = time.time() - start_time
-            await response.read()
-            response.raise_for_status()
-            return url, response_time
+        # Wrap the coroutine `session.get(url)` in `asyncio.wait_for`
+        response = await asyncio.wait_for(session.get(url), timeout=timeout)
+        response_time = time.time() - start_time
+        await response.read()  # Read response to complete the request
+        response.raise_for_status()
+        return url, response_time
     except asyncio.TimeoutError:
         print(f"Timeout: Tile {url} took longer than {timeout} seconds to respond.")
         return url, None
@@ -78,32 +76,45 @@ async def fetch_tile(session, url, timeout=600):
         return url, None
 
 
-async def measure_tile_response_times_by_zoom(tile_data, zoom_levels, output_file_template):
-    for zoom in zoom_levels:
-        print(f"Processing tiles for zoom level {zoom}...")
-        zoom_tile_data = [tile for tile in tile_data if mercantile.zoom(tile["url"]) == zoom]
+async def measure_tile_response_times_by_zoom(tile_data, zoom_levels, output_file):
+    # Open the file in write mode initially to create the file and write the header
+    with open(output_file, mode="w", newline="") as file:
+        writer = csv.writer(file)
+        writer.writerow(["URL", "lon", "lat", "response_time", "zoom"])
 
-        output_file = output_file_template.format(zoom=zoom)
+    for zoom in zoom_levels:
+        print(f"\nProcessing tiles for zoom level {zoom}...")
+        zoom_tile_data = [tile for tile in tile_data if tile["zoom"] == zoom]
+
+        if not zoom_tile_data:
+            print(f"No tiles found for zoom level {zoom}.")
+            continue
+
         async with aiohttp.ClientSession() as session:
             tasks = [fetch_tile(session, tile["url"]) for tile in zoom_tile_data]
             results = [await t for t in tqdm(asyncio.as_completed(tasks), total=len(tasks))]
 
-        # Save results for this zoom level to a CSV file
-        with open(output_file, mode="w", newline="") as file:
+        # Append results for this zoom level to the existing CSV file
+        with open(output_file, mode="a", newline="") as file:
             writer = csv.writer(file)
-            writer.writerow(["URL", "lon", "lat", "response_time"])
+
             for tile, result in zip(zoom_tile_data, results):
                 url = tile["url"]
-                centroid = tile["centroid"]
+                lon, lat = tile["centroid"]
                 _, response_time = result
-                writer.writerow([url, centroid[0], centroid[1], response_time])
 
+                # Write to CSV
+                writer.writerow(
+                    [url, lon, lat, response_time if response_time is not None else "failed", zoom]
+                )
+
+                # Log results
                 if response_time is not None:
-                    print(f"Tile {url} (Centroid: {centroid}) took {response_time:.2f} seconds")
+                    print(f"Tile {url} (Centroid: {lon}, {lat}) took {response_time:.2f} seconds")
                 else:
-                    print(f"Tile {url} (Centroid: {centroid}) failed to fetch.")
+                    print(f"Tile {url} (Centroid: {lon}, {lat}) failed to fetch.")
 
-        print(f"Results for zoom level {zoom} saved to {output_file}")
+    print(f"\nAll results saved to {output_file}")
 
 
 def upload_to_s3(file_path, s3_bucket):
