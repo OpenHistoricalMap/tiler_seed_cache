@@ -3,6 +3,6 @@ joblib
 tqdm
 click
 mercantile
-geopandas
 aiohttp
 boto3
+shapely
