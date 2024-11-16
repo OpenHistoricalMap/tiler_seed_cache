@@ -144,3 +144,4 @@ sphericalpano2cube*.mpc
 data/
 .DS_Store
 tests/.DS_Store
+skipped_tiles.log

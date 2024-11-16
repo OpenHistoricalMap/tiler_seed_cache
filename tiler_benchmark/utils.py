@@ -11,6 +11,7 @@ import boto3
 from botocore.exceptions import NoCredentialsError
 import subprocess
 import asyncio
+import tempfile
 
 
 def tile_to_centroid(x, y, z):
@@ -43,14 +44,10 @@ def geojson_to_tiles(
     result = []
 
     for zoom in zoom_levels:
-        # Get the bounds of the unified geometry
         minx, miny, maxx, maxy = geometry.bounds
-        # Iterate over tiles that intersect the bounding box
         for tile in mercantile.tiles(minx, miny, maxx, maxy, zoom):
-            # Check if the tile geometry intersects the unified geometry
             tile_geom = shape(mercantile.feature(tile)["geometry"])
             if geometry.intersects(tile_geom):
-                # Compute the centroid of the tile
                 centroid_lon, centroid_lat = tile_to_centroid(tile.x, tile.y, tile.z)
                 result.append(
                     {
@@ -66,9 +63,10 @@ def geojson_to_tiles(
     return result
 
 
+
 def seed_tiles(tile_data, concurrency):
     """
-    Seeds tiles using Tegola, skipping previously failed tiles.
+    Seeds tiles using Tegola, skipping previously failed tiles, with verbose logging.
     """
     SKIPPED_TILES_FILE = "skipped_tiles.log"
 
@@ -96,44 +94,66 @@ def seed_tiles(tile_data, concurrency):
             print(f"Skipping previously skipped tile: {tile_string}")
             continue
 
+        # Create a temporary file to hold the tile list
+        with tempfile.NamedTemporaryFile(mode='w+', delete=False) as temp_tile_file:
+            temp_tile_file.write(f"{tile_string}\n")
+            temp_tile_file_path = temp_tile_file.name
+
         try:
             print(f"Seeding tile: {tile_string} with concurrency {concurrency}")
-            result = subprocess.run(
-                [
-                    "tegola", "cache", "seed",
-                    "tile-list", "-",
-                    "--config=/opt/tegola_config/config.toml",
-                    "--map=osm",
-                    "--min-zoom", str(z),
-                    "--max-zoom", str(z),  # Limit to the specific zoom level
-                    f"--concurrency={concurrency}",
-                ],
-                input=f"{tile_string}\n".encode(),
+            # Execute the seeding using a bash command in verbose mode
+            command = f"""
+            tegola cache seed tile-list {temp_tile_file_path} \
+                --config=/opt/tegola_config/config.toml \
+                --map=osm \
+                --min-zoom={z} \
+                --max-zoom=12\
+                --concurrency={concurrency}
+            """
+            print(f"Executing command:\n{command}")
+            process = subprocess.Popen(
+                command,
+                shell=True,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
+                text=True,
             )
 
-            if result.returncode != 0:
+            for line in process.stdout:
+                print(f"STDOUT: {line.strip()}")
+            for line in process.stderr:
+                print(f"STDERR: {line.strip()}")
+
+            process.wait()
+
+            if process.returncode != 0:
                 print(f"Failed to seed tile: {tile_string}")
                 failed_tiles.append(tile_string)
-                save_skipped_tile(tile_string)  # Save failed tile for next run
+                save_skipped_tile(tile_string)
             else:
                 print(f"Successfully seeded tile: {tile_string}")
 
         except Exception as e:
             print(f"Error processing tile {tile_string}: {e}")
-            save_skipped_tile(tile_string)  # Save tile that caused an exception
+            save_skipped_tile(tile_string)
+
+        finally:
+            try:
+                os.remove(temp_tile_file_path)
+            except Exception as cleanup_error:
+                print(f"Failed to remove temporary file: {cleanup_error}")
 
     print("Seeding process complete.")
     if failed_tiles:
         print(f"Failed tiles: {failed_tiles}")
+
 
 async def fetch_tile(session, url, timeout=600):
     start_time = time.time()
     try:
         response = await asyncio.wait_for(session.get(url), timeout=timeout)
         response_time = time.time() - start_time
-        await response.read()  # Read response to complete the request
+        await response.read()
         response.raise_for_status()
         return url, response_time
     except asyncio.TimeoutError:
