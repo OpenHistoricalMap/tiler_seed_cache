@@ -10,7 +10,8 @@ RUN apk update && apk add --no-cache \
     geos-dev \
     python3-dev \
     py3-pip \
-    build-base
+    build-base \
+    proj-util
 
 # Ensure PROJ_DIR and PATH are set
 ENV PROJ_DIR=/usr

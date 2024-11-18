@@ -1,32 +1,16 @@
 import requests
 import mercantile
-from shapely.geometry import shape
-from shapely.ops import unary_union 
-import aiohttp
-import time
+from shapely.geometry import shape, Point, mapping
+from shapely.ops import unary_union
 import csv
 import os
-from tqdm import tqdm
-import boto3
-from botocore.exceptions import NoCredentialsError
 import subprocess
-import asyncio
 import tempfile
+import json
+from smart_open import open as s3_open
 
 
-def tile_to_centroid(x, y, z):
-    bounds = mercantile.bounds(x, y, z)
-    centroid_lon = (bounds.west + bounds.east) / 2
-    centroid_lat = (bounds.south + bounds.north) / 2
-
-    return centroid_lon, centroid_lat
-
-def geojson_to_tiles(
-    geojson_url,
-    zoom_levels,
-    base_url="https://vtiles.openhistoricalmap.org/maps/osm/{z}/{x}/{y}.pbf",
-):
-    # Fetch GeoJSON data
+def read_geojson_boundary(geojson_url, feature_type, buffer_distance_km=0.01):
     response = requests.get(geojson_url)
     response.raise_for_status()
     geojson_data = response.json()
@@ -36,24 +20,55 @@ def geojson_to_tiles(
 
     if not geometries:
         print("No geometry found in GeoJSON.")
+        return None
+
+    if feature_type == "Polygon":
+        return unary_union(geometries)
+    elif feature_type == "Point":
+        buffered_geometries = [geom.buffer(buffer_distance_km) for geom in geometries if isinstance(geom, Point)]
+        return unary_union(buffered_geometries) if buffered_geometries else None
+    else:
+        raise ValueError(f"Unsupported feature type: {feature_type}. Supported types are 'polygon' and 'point'.")
+
+
+def save_geojson_boundary(boundary_geometry, file_path):
+    if boundary_geometry is None:
+        print("No geometry to save.")
+        return
+
+    try:
+        geojson_data = {
+            "type": "FeatureCollection",
+            "features": [
+                {
+                    "type": "Feature",
+                    "geometry": mapping(boundary_geometry),
+                    "properties": {}
+                }
+            ]
+        }
+
+        # Save to file
+        with open(file_path, "w", encoding="utf-8") as file:
+            json.dump(geojson_data, file, ensure_ascii=False, indent=4)
+        print(f"GeoJSON saved successfully to {file_path}")
+    except Exception as e:
+        print(f"Error saving GeoJSON file: {e}")
+
+
+def boundary_to_tiles(boundary_geometry, zoom_levels):
+    if boundary_geometry is None:
+        print("No valid geometry provided.")
         return []
-
-    # Create a unified geometry (unary union)
-    geometry = unary_union(geometries)
-
     result = []
 
     for zoom in zoom_levels:
-        minx, miny, maxx, maxy = geometry.bounds
+        minx, miny, maxx, maxy = boundary_geometry.bounds
         for tile in mercantile.tiles(minx, miny, maxx, maxy, zoom):
             tile_geom = shape(mercantile.feature(tile)["geometry"])
-            if geometry.intersects(tile_geom):
-                centroid_lon, centroid_lat = tile_to_centroid(tile.x, tile.y, tile.z)
+            if boundary_geometry.intersects(tile_geom):
                 result.append(
                     {
-                        "url": base_url.format(z=tile.z, x=tile.x, y=tile.y),
-                        "centroid": (centroid_lon, centroid_lat),
-                        "zoom": zoom, 
                         "z": tile.z,
                         "x": tile.x,
                         "y": tile.y
@@ -63,24 +78,35 @@ def geojson_to_tiles(
     return result
 
 
-
-def seed_tiles(tile_data, concurrency):
+def seed_tiles(tile_data, concurrency, min_zoom, max_zoom, log_file, skipped_tiles_file):
     """
     Seeds tiles using Tegola, skipping previously failed tiles, with verbose logging.
+    Saves logs containing "took" (tile path and time) to a specified CSV file.
+    Skips previously failed tiles and updates the skipped tiles file with new failures.
     """
-    SKIPPED_TILES_FILE = "skipped_tiles.log"
-
     def load_skipped_tiles():
-        """Load previously skipped tiles from the log file."""
-        if os.path.exists(SKIPPED_TILES_FILE):
-            with open(SKIPPED_TILES_FILE, "r") as file:
+        """Load previously skipped tiles from the file, or start fresh if the file doesn't exist."""
+        if os.path.exists(skipped_tiles_file):
+            with open(skipped_tiles_file, "r") as file:
                 return set(line.strip() for line in file)
         return set()
 
-    def save_skipped_tile(tile):
-        """Save a skipped tile to the log file."""
-        with open(SKIPPED_TILES_FILE, "a") as file:
-            file.write(f"{tile}\n")
+    def save_skipped_tiles(skipped_tiles):
+        """Overwrite the skipped tiles file with the new set of skipped tiles."""
+        with open(skipped_tiles_file, "w") as file:
+            for tile in skipped_tiles:
+                file.write(f"{tile}\n")
+
+    def save_took_log_csv(log_data):
+        """Save logs containing 'took' (tile path and time) to a CSV file."""
+        with open(log_file, "a", newline="") as file:
+            writer = csv.writer(file)
+            writer.writerow(log_data)
+
+    # Initialize CSV file with headers
+    with open(log_file, "w", newline="") as file:
+        writer = csv.writer(file)
+        writer.writerow(["Tile", "Time"])
 
     skipped_tiles = load_skipped_tiles()
     failed_tiles = []
@@ -106,8 +132,8 @@ def seed_tiles(tile_data, concurrency):
             tegola cache seed tile-list {temp_tile_file_path} \
                 --config=/opt/tegola_config/config.toml \
                 --map=osm \
-                --min-zoom={z} \
-                --max-zoom=12\
+                --min-zoom={min_zoom} \
+                --max-zoom={max_zoom} \
                 --concurrency={concurrency}
             """
             print(f"Executing command:\n{command}")
@@ -121,6 +147,14 @@ def seed_tiles(tile_data, concurrency):
 
             for line in process.stdout:
                 print(f"STDOUT: {line.strip()}")
+                if "took" in line:
+                    # Extract the tile path and time
+                    parts = line.strip().split()
+                    tile_path = parts[8].strip("()")  # Extract "13/2408/3077"
+                    time_info = parts[-1]            # Extract "10201ms"
+                    print(f"Extracted log: {tile_path} {time_info}")
+                    save_took_log_csv([tile_path, time_info])
+
             for line in process.stderr:
                 print(f"STDERR: {line.strip()}")
 
@@ -129,13 +163,12 @@ def seed_tiles(tile_data, concurrency):
             if process.returncode != 0:
                 print(f"Failed to seed tile: {tile_string}")
                 failed_tiles.append(tile_string)
-                save_skipped_tile(tile_string)
             else:
                 print(f"Successfully seeded tile: {tile_string}")
 
         except Exception as e:
             print(f"Error processing tile {tile_string}: {e}")
-            save_skipped_tile(tile_string)
+            failed_tiles.append(tile_string)
 
         finally:
             try:
@@ -143,72 +176,17 @@ def seed_tiles(tile_data, concurrency):
             except Exception as cleanup_error:
                 print(f"Failed to remove temporary file: {cleanup_error}")
 
+    # Update skipped tiles file with the new failures
+    save_skipped_tiles(set(failed_tiles))
     print("Seeding process complete.")
     if failed_tiles:
         print(f"Failed tiles: {failed_tiles}")
+    return failed_tiles
 
-
-async def fetch_tile(session, url, timeout=600):
-    start_time = time.time()
-    try:
-        response = await asyncio.wait_for(session.get(url), timeout=timeout)
-        response_time = time.time() - start_time
-        await response.read()
-        response.raise_for_status()
-        return url, response_time
-    except asyncio.TimeoutError:
-        print(f"Timeout: Tile {url} took longer than {timeout} seconds to respond.")
-        return url, None
-    except Exception as e:
-        print(f"Failed to fetch tile {url}: {e}")
-        return url, None
-
-
-async def measure_tile_response_times_by_zoom(tile_data, zoom_levels, output_file):
-    with open(output_file, mode="w", newline="") as file:
-        writer = csv.writer(file)
-        writer.writerow(["URL", "lon", "lat", "response_time", "zoom"])
-
-    for zoom in zoom_levels:
-        print(f"\nProcessing tiles for zoom level {zoom}...")
-        zoom_tile_data = [tile for tile in tile_data if tile["zoom"] == zoom]
-
-        if not zoom_tile_data:
-            print(f"No tiles found for zoom level {zoom}.")
-            continue
-
-        async with aiohttp.ClientSession() as session:
-            tasks = [fetch_tile(session, tile["url"]) for tile in zoom_tile_data]
-            results = [await t for t in tqdm(asyncio.as_completed(tasks), total=len(tasks))]
-
-        with open(output_file, mode="a", newline="") as file:
-            writer = csv.writer(file)
-
-            for tile, result in zip(zoom_tile_data, results):
-                url = tile["url"]
-                lon, lat = tile["centroid"]
-                _, response_time = result
-
-                writer.writerow(
-                    [url, lon, lat, response_time if response_time is not None else "failed", zoom]
-                )
-
-                if response_time is not None:
-                    print(f"Tile {url} (Centroid: {lon}, {lat}) took {response_time:.2f} seconds")
-                else:
-                    print(f"Tile {url} (Centroid: {lon}, {lat}) failed to fetch.")
-
-    print(f"\nAll results saved to {output_file}")
-
-
-def upload_to_s3(file_path, s3_bucket):
-    s3 = boto3.client("s3")
-    s3_key = os.path.basename(file_path)
-    s3_key = f"tiler_benchmark/{s3_key}"
-    try:
-        s3.upload_file(file_path, s3_bucket, s3_key)
-        print(f"File uploaded to s3://{s3_bucket}/{s3_key}")
-    except FileNotFoundError:
-        print(f"File {file_path} not found.")
-    except NoCredentialsError:
-        print("Credentials not available for S3 upload.")
+def upload_to_s3(local_file, s3_bucket, s3_key):
+    s3_url = f"s3://{s3_bucket}/{s3_key}"
+    print(f"Uploading {local_file} to {s3_url}...")
+    with open(local_file, "rb") as local:
+        with s3_open(s3_url, "wb") as remote:
+            remote.write(local.read())
+    print(f"Uploaded {local_file} to {s3_url}.")
