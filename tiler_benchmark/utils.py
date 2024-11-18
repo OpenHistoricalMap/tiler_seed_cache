@@ -14,8 +14,6 @@ def read_geojson_boundary(geojson_url, feature_type, buffer_distance_km=0.01):
     response = requests.get(geojson_url)
     response.raise_for_status()
     geojson_data = response.json()
-
-    # Extract geometries from GeoJSON features
     geometries = [shape(feature["geometry"]) for feature in geojson_data["features"]]
 
     if not geometries:
@@ -56,34 +54,28 @@ def save_geojson_boundary(boundary_geometry, file_path):
         print(f"Error saving GeoJSON file: {e}")
 
 
-def boundary_to_tiles(boundary_geometry, zoom_levels):
+def boundary_to_tiles(boundary_geometry, min_zoom):
     if boundary_geometry is None:
         print("No valid geometry provided.")
         return []
-    result = []
 
-    for zoom in zoom_levels:
-        minx, miny, maxx, maxy = boundary_geometry.bounds
-        for tile in mercantile.tiles(minx, miny, maxx, maxy, zoom):
-            tile_geom = shape(mercantile.feature(tile)["geometry"])
-            if boundary_geometry.intersects(tile_geom):
-                result.append(
-                    {
-                        "z": tile.z,
-                        "x": tile.x,
-                        "y": tile.y
-                    }
-                )
+    result = []
+    minx, miny, maxx, maxy = boundary_geometry.bounds
+    for tile in mercantile.tiles(minx, miny, maxx, maxy, min_zoom):
+        tile_geom = shape(mercantile.feature(tile)["geometry"])
+        if boundary_geometry.intersects(tile_geom):
+            result.append(
+                {
+                    "z": tile.z,
+                    "x": tile.x,
+                    "y": tile.y
+                }
+            )
 
     return result
 
 
 def seed_tiles(tile_data, concurrency, min_zoom, max_zoom, log_file, skipped_tiles_file):
-    """
-    Seeds tiles using Tegola, skipping previously failed tiles, with verbose logging.
-    Saves logs containing "took" (tile path and time) to a specified CSV file.
-    Skips previously failed tiles and updates the skipped tiles file with new failures.
-    """
     def load_skipped_tiles():
         """Load previously skipped tiles from the file, or start fresh if the file doesn't exist."""
         if os.path.exists(skipped_tiles_file):
@@ -145,6 +137,7 @@ def seed_tiles(tile_data, concurrency, min_zoom, max_zoom, log_file, skipped_til
                 text=True,
             )
 
+            # Process STDOUT and STDERR
             for line in process.stdout:
                 print(f"STDOUT: {line.strip()}")
                 if "took" in line:
@@ -176,7 +169,6 @@ def seed_tiles(tile_data, concurrency, min_zoom, max_zoom, log_file, skipped_til
             except Exception as cleanup_error:
                 print(f"Failed to remove temporary file: {cleanup_error}")
 
-    # Update skipped tiles file with the new failures
     save_skipped_tiles(set(failed_tiles))
     print("Seeding process complete.")
     if failed_tiles:
@@ -190,3 +182,4 @@ def upload_to_s3(local_file, s3_bucket, s3_key):
         with s3_open(s3_url, "wb") as remote:
             remote.write(local.read())
     print(f"Uploaded {local_file} to {s3_url}.")
+    

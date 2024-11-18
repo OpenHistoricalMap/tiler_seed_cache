@@ -63,7 +63,7 @@ def main(geojson_url, feature_type, zoom_levels, concurrency, log_file, s3_bucke
     upload_to_s3(geojson_file, s3_bucket, f"tiler/logs/{geojson_file}")
 
     # Generate tiles based on boundary geometry and zoom levels
-    tiles = boundary_to_tiles(boundary_geometry, zoom_levels)
+    tiles = boundary_to_tiles(boundary_geometry, min_zoom)
 
     skipped_tiles_file = f"skipped_tiles_{log_file}"
     # Seed the tiles
@@ -74,7 +74,7 @@ def main(geojson_url, feature_type, zoom_levels, concurrency, log_file, s3_bucke
     print("Tile seeding complete.")
     print(f"Skipped tiles saved to: {skipped_tiles_file}")
     print(f"Log of seeding performance saved to: {log_file}")
-
+    
     # Upload log files to S3
     upload_to_s3(log_file, s3_bucket, f"tiler/logs/{log_file}")
     upload_to_s3(skipped_tiles_file, s3_bucket, f"tiler/logs/{skipped_tiles_file}")
